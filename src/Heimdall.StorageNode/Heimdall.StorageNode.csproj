@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <RootNamespace>Heimdall.StorageNode</RootNamespace>
+    <AssemblyName>Heimdall.StorageNode</AssemblyName>
+    <UserSecretsId>heimdall-storage-node</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.S3" Version="3.7.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Heimdall.Shared\Heimdall.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The unit tests exercise internal helpers (slug building, short-read handling) directly. -->
+    <InternalsVisibleTo Include="Heimdall.Tests" />
+  </ItemGroup>
+
+</Project>

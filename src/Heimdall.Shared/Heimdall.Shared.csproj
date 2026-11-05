@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Heimdall.Shared</RootNamespace>
+    <AssemblyName>Heimdall.Shared</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The unit tests exercise internal helpers (slug building, short-read handling) directly. -->
+    <InternalsVisibleTo Include="Heimdall.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+.nuget/
+.git/
+.github/
+.vs/
+.idea/
+*.user
+artifacts/
+samples/

@@ -1,0 +1,17 @@
+{
+  "Cluster": {
+    "ApiKey": "dev-heimdall-key",
+    "VirtualNodesPerNode": 512,
+    "ReplicationFactor": 3,
+    "ReadReplicaPercentage": 60,
+    "NodeRequestTimeout": "00:00:30",
+    "Nodes": [
+      { "Id": "node-1", "BaseUrl": "http://storage-node-1:8080", "Weight": 1 },
+      { "Id": "node-2", "BaseUrl": "http://storage-node-2:8080", "Weight": 1 },
+      { "Id": "node-3", "BaseUrl": "http://storage-node-3:8080", "Weight": 1 },
+      { "Id": "node-4", "BaseUrl": "http://storage-node-4:8080", "Weight": 1 },
+      { "Id": "node-5", "BaseUrl": "http://storage-node-5:8080", "Weight": 1 },
+      { "Id": "node-6", "BaseUrl": "http://storage-node-6:8080", "Weight": 1 }
+    ]
+  }
+}

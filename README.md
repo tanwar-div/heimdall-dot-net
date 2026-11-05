@@ -1,8 +1,19 @@
-# Distributed Video Streaming API
+# Heimdall — Distributed Video Streaming & Load-Balancing API
 
-A horizontally scalable video upload and delivery platform built as **three independently deployable .NET services** on top of **MinIO** object storage. Videos are sharded across a cluster of storage nodes using a **consistent-hashing ring with virtual nodes**, replicated asynchronously, and served with **true streaming I/O** — including HTTP `Range` / `206 Partial Content` support, so multi-gigabyte files are seekable and never buffered in full by any process.
+A horizontally scalable video upload and delivery platform built as **three independently deployable
+.NET services** on top of **MinIO** object storage. Videos are sharded across a cluster of storage
+nodes using a **consistent-hashing ring with virtual nodes**, replicated asynchronously, and served
+with **true streaming I/O** — including HTTP `Range` / `206 Partial Content`, so multi-gigabyte files
+are seekable and never buffered in full by any process.
 
-The whole thing runs as a real multi-process cluster: **8 containers** (6 storage nodes + gateway + MinIO) via Docker Compose.
+The whole thing runs as a real multi-process cluster: **8 containers** (6 storage nodes + gateway +
+MinIO) via Docker Compose.
+
+```bash
+docker compose up -d --build
+scripts/smoke-test.sh          # 23 end-to-end checks, including killing a node mid-download
+open http://localhost:8090
+```
 
 ---
 
@@ -12,10 +23,11 @@ The whole thing runs as a real multi-process cluster: **8 containers** (6 storag
 - [Architecture](#architecture)
 - [How it works](#how-it-works)
   - [Consistent hashing ring](#consistent-hashing-ring)
-  - [Replication](#replication)
   - [Read path and load balancing](#read-path-and-load-balancing)
   - [Streaming and byte ranges](#streaming-and-byte-ranges)
   - [Failover](#failover)
+  - [Replication](#replication)
+  - [Authentication](#authentication)
 - [Repository layout](#repository-layout)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
@@ -28,9 +40,18 @@ The whole thing runs as a real multi-process cluster: **8 containers** (6 storag
 
 ## Why this exists
 
-Most "video API" samples are a single process writing to a single disk or a single S3 bucket. That hides every interesting problem: where does a given video live, what happens when the machine holding it dies, and how do you serve a 4 GB file to a browser that wants bytes 1,200,000,000–1,200,065,535 without loading the whole thing into memory?
+Most "video API" samples are a single process writing to a single disk or a single S3 bucket. That
+hides every interesting problem: where does a given video live, what happens when the machine
+holding it dies, and how do you serve a 4 GB file to a browser that wants bytes
+1,200,000,000–1,200,065,535 without loading the whole thing into memory?
 
-This project answers those questions explicitly, with no central lookup table and no full-file buffering anywhere in the request path.
+This project answers those questions explicitly, with **no central lookup table** and **no full-file
+buffering** anywhere in the request path.
+
+Two numbers from the live cluster, for calibration: relaying a 1 GiB download leaves the gateway at
+**51 MiB** of resident memory, and a storage node that stored *and* served that same gigabyte peaks
+at **86 MiB**. Those figures do not move with file size, because nothing in the path is proportional
+to it.
 
 ---
 
@@ -40,10 +61,10 @@ This project answers those questions explicitly, with no central lookup table an
 flowchart TB
     Client([Client / browser])
 
-    subgraph GW[Gateway]
-        Ring[Consistent-hash ring<br/>virtual nodes]
-        LB[Replica load balancer]
-        Health[Node health tracker]
+    subgraph GW[Gateway · stateless]
+        Ring[Consistent-hash ring<br/>512 virtual nodes per node]
+        LB[Replica load balancer<br/>rotating selection]
+        Proxy[Streaming proxy<br/>range passthrough + resume]
     end
 
     subgraph Cluster[Storage node cluster]
@@ -55,12 +76,12 @@ flowchart TB
         N6[storage-node-6]
     end
 
-    MinIO[(MinIO<br/>object storage)]
+    MinIO[(MinIO<br/>bucket per node)]
 
     Client -->|upload / stream| GW
-    Ring --> LB --> Cluster
-    N1 -. async replication .-> N2
-    N2 -. async replication .-> N3
+    Ring --> LB --> Proxy --> Cluster
+    N3 -. async replication .-> N6
+    N3 -. async replication .-> N5
     Cluster --> MinIO
 ```
 
@@ -68,11 +89,41 @@ Three deployable units:
 
 | Service | Project | Role |
 |---|---|---|
-| **Gateway** | `src/Gateway` | Public HTTP surface. Owns the hashing ring, picks the primary for writes, load-balances reads across replicas, handles failover, proxies byte ranges. Stateless — run as many as you like behind a VIP. |
-| **Storage node** | `src/StorageNode` | Owns a slice of the keyspace. Writes chunks to MinIO, serves ranges back, pushes replicas to its successors. Identical binary, different identity via config. |
-| **Shared library** | `src/Shared` | The hash ring, node descriptors, DTOs, range parsing, retry policies, API-key auth handler. Referenced by both services so routing logic can never drift between them. |
+| **Gateway** | `src/Heimdall.Gateway` | Public HTTP surface. Owns the hashing ring, picks the primary for writes, load balances reads across replicas, handles failover and mid-stream resume, proxies byte ranges. Stateless — run as many as you like behind a VIP. |
+| **Storage node** | `src/Heimdall.StorageNode` | Owns a slice of the keyspace. Writes chunks to MinIO, serves ranges back, pushes replicas to its successors. Identical binary, different identity via config. |
+| **Shared library** | `src/Heimdall.Shared` | The hash ring, node descriptors, DTOs, range and chunk math, the node HTTP client, retry policy, API-key guard. Referenced by both services so routing logic can never drift between them. |
 
-MinIO is the durable layer underneath. Each node writes into its own prefix (`node-{id}/{videoId}/chunk-{n}`), so node ownership stays legible in storage and a node can be rebuilt from its prefix alone.
+MinIO is the durable layer underneath. **Each node owns its own bucket** (`heimdall-node-{n}`), so a
+replica is a genuinely separate copy of the bytes rather than a second pointer at one object, and a
+node can be rebuilt from its bucket alone.
+
+### Request flow
+
+```
+          POST /api/videos                         GET /api/videos/{id}
+                 │                                   Range: bytes=8388607-8388609
+                 ▼                                             │
+        ┌──────────────────┐                                   ▼
+        │     Gateway      │                          ┌──────────────────┐
+        │                  │                          │     Gateway      │
+        │ hash(id) ─► ring │                          │ hash(id) ─► ring │
+        │   primary only   │                          │  ▼               │
+        └────────┬─────────┘                          │ load balancer:   │
+                 │ streamed PUT                       │ 60% of replicas, │
+                 ▼                                    │ rotated, then    │
+        ┌──────────────────┐                          │ the full chain   │
+        │  node-3 (owner)  │                          └────────┬─────────┘
+        │  chunk 0,1,2…    │                                   │ Range passthrough
+        │  manifest last   │                                   ▼
+        └────────┬─────────┘                          ┌──────────────────┐
+                 │ async, retried                     │ node-6 (replica) │
+          ┌──────┴──────┐                             │ chunk 0 tail +   │
+          ▼             ▼                             │ chunk 1 head     │
+     ┌─────────┐   ┌─────────┐                        └────────┬─────────┘
+     │ node-6  │   │ node-5  │                                 │ 206 Partial Content
+     └─────────┘   └─────────┘                                 ▼
+                                                           3 bytes
+```
 
 ---
 
@@ -80,43 +131,177 @@ MinIO is the durable layer underneath. Each node writes into its own prefix (`no
 
 ### Consistent hashing ring
 
-Each physical storage node is projected onto the ring as **N virtual nodes** (default 150) by hashing `"{nodeId}#{vnodeIndex}"`. A video's key is hashed with the same function; the owning **primary** is the first virtual node clockwise from the key's position.
+Each physical storage node is projected onto a 64-bit ring as **N virtual nodes** (default **512**)
+by hashing `"{nodeId}#{vnodeIndex}"`. A video's key is hashed with the same function; the owning
+**primary** is the first virtual node clockwise from the key's position, and continuing clockwise
+past tokens belonging to already-seen nodes yields the **preference list** (primary + replicas).
 
-Virtual nodes matter here: with 6 physical nodes and no virtualization, key distribution skews badly and removing one node dumps its entire share onto a single neighbour. At 150 vnodes each, ownership stays within a few percent of even, and adding or removing a node only remaps roughly `1/n` of the keyspace.
+The hash is SHA-256 truncated to its first 8 bytes, big-endian. It must be identical in every
+process and across every run, which rules out `string.GetHashCode()`.
 
-Crucially, **there is no lookup table**. The gateway computes ownership from the ring; any gateway instance with the same node list reaches the same answer for the same key, so gateways need no shared state and no coordination.
+Virtual nodes are what make the distribution usable. Measured over 120,000 keys on six nodes:
 
-### Replication
+| Tokens per node | Worst node's deviation from an even share |
+|---|---|
+| 1 | 89% |
+| 16 | 34% |
+| 64 | 31% |
+| 160 | 17% |
+| **512** (default) | **5.5%** |
+| 1024 | 2.7% |
 
-After the primary has durably written all chunks, it replicates to the next `ReplicationFactor - 1` distinct physical nodes clockwise on the ring. Replication is:
+512 is where the curve flattens, and 3,072 tokens for six nodes costs nothing to build or
+binary-search. `GET /api/cluster/distribution?keys=50000` reports this against the live ring.
 
-- **Asynchronous** — the upload response returns as soon as the primary is durable, so writes aren't held hostage by a slow peer.
-- **Over plain HTTP** — nodes talk to each other through the same internal API clients use, which keeps one code path for reads and makes the system trivially debuggable with `curl`.
-- **Retried** with exponential backoff and jitter; a replica that stays unreachable is logged and left for the reconciliation pass.
-- **Authenticated** — every write and replication call carries `X-Api-Key`. Reads are open by default (put your auth at the gateway); writes never are.
+Adding or removing a node only remaps roughly `1/n` of the keyspace — and a unit test asserts the
+stronger property that every key which moves when a node joins moves **onto the new node**, never
+between two pre-existing ones.
+
+Weights work too: a node configured `"Weight": 3` claims three times the tokens and owns roughly
+three times the keyspace.
+
+Crucially, **there is no lookup table**. The gateway computes ownership from the ring; so does every
+storage node. Any process with the same node list reaches the same answer for the same key, so there
+is nothing to coordinate and nothing to keep in sync. `deploy/cluster.json` — mounted read-only into
+all seven .NET containers — is that shared input.
 
 ### Read path and load balancing
 
-For a read, the gateway resolves the full replica set for the key, then selects a **configurable percentage** of that set as candidates (`ReadReplicaPercentage`, default 50%) and picks among them. This is the interesting knob:
+The ring says which nodes hold a video. The load balancer decides which to *ask*, and in what order:
 
-- At **100%**, reads spread across every replica — maximum throughput, coldest caches.
-- At **~33–50%**, reads concentrate on a subset, so page cache and MinIO read-ahead on those nodes actually stay warm, while still avoiding a single hot primary.
+1. Take the replicas (preference list minus the primary) and select
+   `ceil(replicaCount × ReadReplicaPercentage / 100)` of them — 2 of 2 at the default 60%.
+2. **Rotate the selection window per request**, so consecutive reads of one hot video land on
+   different replicas. The counter is process-local: each gateway instance spreads its own traffic,
+   with no shared state to coordinate.
+3. Append the primary, then any unselected replicas.
 
-The selection is deterministic per `videoId` within the chosen subset, so repeat requests for the same video keep landing on the same node and benefit from its warm cache — without a central router deciding anything.
+Step 3 is the one that matters structurally: the returned list is always a **permutation of the full
+preference list**, so it doubles as the failover chain and a read only fails once *every* holder has
+been tried. At `ReadReplicaPercentage: 0` the primary goes first and replicas become pure failover;
+at 100 the primary is reserved entirely for writes.
+
+Every response reports what happened, which is how the routing stays observable:
+
+```
+X-Heimdall-Primary-Node:    node-3
+X-Heimdall-Read-Candidates: node-6,node-5,node-3
+X-Heimdall-Served-By:       node-5
+X-Heimdall-Failover-From:   node-6
+```
 
 ### Streaming and byte ranges
 
 Nothing in the request path ever holds a whole video.
 
-**Upload:** the request body is read as a stream and sliced into fixed-size chunks (default 8 MiB), each pushed to MinIO as it fills. Memory use is bounded by the chunk buffer, not the file size.
+**Upload.** The request body is read as a stream and sliced into fixed-size chunks (default 8 MiB),
+each pushed to MinIO as it fills. Memory is bounded by the chunk buffer, not the file size. The read
+loop fills each chunk completely rather than trusting one `ReadAsync` — a network stream returns
+short reads constantly, and an undersized chunk would silently corrupt every subsequent range
+calculation. (A unit test feeds ingest 7 bytes at a time and asserts the stored chunks are still
+exactly 8 MiB.)
 
-**Download:** the gateway parses `Range: bytes=start-end`, maps it onto chunk boundaries with integer math (`firstChunk = start / chunkSize`, `offsetInFirst = start % chunkSize`, and symmetric math for the tail), fetches only the chunks that intersect the range, trims the first and last, and pipes the result straight to the response body.
+A video becomes `{videoId}/chunk-00000 … {videoId}/chunk-NNNNN` plus `{videoId}/manifest.json`. The
+manifest holds the length, chunk size, content type and a **SHA-256 of the full byte stream**,
+computed on the way through during ingest — which is what lets the smoke test assert a download is
+byte-identical to its upload, and what the HTTP `ETag` is derived from.
 
-A correct `206 Partial Content` response is returned with `Content-Range`, `Content-Length`, and `Accept-Ranges: bytes`, so `<video>` elements, ffmpeg, and download managers can all seek. Malformed or unsatisfiable ranges get `416` rather than a silent full-body response.
+**The manifest is written last, deliberately.** Its presence is the commit marker: a node that dies
+mid-ingest leaves orphaned chunks and no manifest, and reads for that id return 404 rather than a
+truncated video.
+
+**Download.** The gateway parses nothing — it passes `Range` through to the node, which maps it onto
+chunk boundaries with integer math (`firstChunk = start / chunkSize`, `offsetInFirst =
+start % chunkSize`, symmetric for the tail), fetches only the chunks that intersect the range, trims
+the first and last, and pipes the result straight to the response body.
+
+A correct `206 Partial Content` is returned with `Content-Range`, `Content-Length` and
+`Accept-Ranges: bytes`, so `<video>` elements, ffmpeg and download managers can all seek. Supported
+forms are `bytes=N-M`, `bytes=N-` and the suffix form `bytes=-N`; an over-long end is clamped, a
+start past EOF gets `416` with `Content-Range: bytes */<length>` rather than a silent full body, and
+a multi-range request falls back to a full `200` rather than inventing a `multipart/byteranges`
+response.
 
 ### Failover
 
-Every outbound call carries a short timeout. If the selected replica is unreachable, times out, or returns 5xx, the gateway marks it unhealthy, walks to the next replica in the set, and retries — **mid-stream if necessary**, resuming from the byte offset already delivered so the client never sees a truncated response. The unhealthy mark decays, so a node that comes back is folded into rotation automatically without a restart.
+Reads fail over in two distinct places, because there are two distinct kinds of failure.
+
+**Before the response starts.** Each candidate is tried in load-balancer order until one returns
+usable headers. A connection refused, a DNS failure, a 5xx, or a wait for headers longer than
+`Gateway:CandidateHeaderTimeout` all move on to the next holder. Nothing is written to the client
+until a candidate has produced headers, which is the whole trick: a status line cannot be unsent, so
+every failover decision has to happen while only headers are in hand.
+
+A 404 from one node means "this replica has not caught up yet" and falls through to the next holder.
+Only a 404 from *every* holder, with none of them failing, is reported to the client as 404 — if even
+one node was unreachable the honest answer is 503, because its copy might be the one that has the
+video.
+
+**After the response starts.** The hard case: the node dies with the body half delivered. The status
+line and `Content-Length` are already on the wire and cannot be revised — but they do not need to
+be. What the client was promised is a specific absolute byte range, and any holder can supply the
+unsent remainder: the gateway recovers its absolute file offset from the upstream `Content-Range`,
+re-requests `bytes={position}-{end}` from the next candidate, and keeps writing into the **same**
+response. The client sees one uninterrupted, complete body and never learns it came from two
+machines.
+
+Two details make this safe rather than merely clever:
+
+- A resume candidate answering with `200` instead of `206` is **refused**. A 200 means "here is the
+  file from byte zero"; appending that to what has already been sent would produce a corrupt body
+  that still matched `Content-Length` — the worst possible outcome. The next holder is tried instead.
+- The copy loop distinguishes "the node stopped sending" (resumable) from "the client stopped
+  listening" (not), by pumping reads and writes separately instead of calling `Stream.CopyToAsync`.
+
+A node that is SIGKILLed or partitioned away sends no RST, so a blocking socket read against it
+never returns. `Gateway:RelayIdleTimeout` (15s) bounds the wait for upstream bytes so the resume
+path can actually fire. It deliberately does *not* bound writes to the client — a paused player is
+parked in a write, and should be able to idle indefinitely.
+
+Verified live, not just in unit tests: `scripts/smoke-test.sh` starts a rate-limited download,
+`docker kill`s the node serving it partway through, and asserts the delivered file is byte-identical
+to the source.
+
+```
+Relay of resume-test-e6c3178f350a from node-5 broke at byte 32700862;
+  resuming bytes=32700862-59999999 from node-3.
+```
+
+### Replication
+
+After the primary has durably written all chunks *and* its manifest, it queues the video and a
+background worker pushes it to the next `ReplicationFactor - 1` distinct physical nodes clockwise on
+the ring — targets it derives itself from the video id, rather than being told. Replication is:
+
+- **Asynchronous** — the upload response returns as soon as the primary is durable, so a client pays
+  one write rather than three and a slow peer cannot hold a write hostage.
+- **Over plain HTTP** — nodes talk to each other through the same internal API the gateway uses,
+  which keeps one code path for reads and makes the system debuggable with `curl`.
+- **Retried** with exponential backoff and full jitter (4 attempts by default). Each attempt opens a
+  *fresh* chunk stream, because a partly-consumed HTTP request body cannot be resent, and each is
+  bounded by `Node:ReplicationAttemptTimeout` so a vanished replica cannot park the worker forever.
+  A target that already holds the video with a matching hash is skipped.
+- **Authenticated** — every write and replication call carries `X-Heimdall-Key`.
+- **Non-recursive** — replication traffic is marked `X-Heimdall-Replica-Write`, and a node receiving
+  it does not re-replicate. Otherwise the cluster would gossip the same video around the ring
+  forever.
+
+Targets are pushed concurrently, since the copies are independent and replica latency is otherwise
+additive. `GET /internal/replication/{videoId}` on any node reports per-target state and attempt
+counts.
+
+The trade-off of asynchrony is a window in which only the primary has the video. A read that load
+balances onto a not-yet-caught-up replica gets a 404 from it and falls through — which is exactly why
+the proxy treats a single 404 as "try the next holder".
+
+### Authentication
+
+Writes (upload, replication, delete) require `X-Heimdall-Key`, compared in fixed time so a wrong key
+leaks nothing through response timing. Reads are open, because the point of the service is for a
+`<video>` element to be able to play — put user-facing auth at the gateway's edge.
+
+If no key is configured, the write paths return **503 rather than running unauthenticated**. Unset
+means disabled, not open.
 
 ---
 
@@ -125,197 +310,248 @@ Every outbound call carries a short timeout. If the selected replica is unreacha
 ```
 .
 ├── src/
-│   ├── Gateway/                  # public API, ring, load balancer, failover
-│   │   ├── Controllers/
-│   │   ├── Services/             # RingRouter, ReplicaLoadBalancer, NodeHealthTracker
-│   │   └── Program.cs
-│   ├── StorageNode/              # chunked write/read against MinIO, replication
-│   │   ├── Controllers/
-│   │   ├── Services/             # ChunkedObjectStore, ReplicationDispatcher
-│   │   └── Program.cs
-│   └── Shared/                   # ring, DTOs, range parsing, auth, retry policies
-│       ├── Hashing/
-│       ├── Models/
-│       └── Http/
-├── tests/
-│   └── Shared.Tests/             # xUnit: hashing, failover, byte-range math
-├── docker-compose.yml            # 6 storage nodes + gateway + MinIO
-├── Dockerfile.gateway
-├── Dockerfile.storagenode
-└── DistributedVideoStreaming.sln
+│   ├── Heimdall.Gateway/              # public API, ring, load balancer, failover, resume
+│   │   ├── Endpoints/                 # VideoEndpoints, ClusterEndpoints
+│   │   ├── Proxy/VideoStreamProxy.cs  # candidate walk, range passthrough, mid-stream resume
+│   │   ├── Routing/                   # VideoUploadService (streaming + multipart), VideoId
+│   │   └── wwwroot/index.html         # browser console: upload, seek, see the routing
+│   ├── Heimdall.StorageNode/          # chunked write/read against MinIO, replication
+│   │   ├── Endpoints/VideoEndpoints.cs
+│   │   ├── Storage/                   # IObjectStore, S3ObjectStore, ChunkedVideoRepository
+│   │   └── Replication/               # ReplicationQueue, ReplicationWorker
+│   └── Heimdall.Shared/               # one implementation of everything both sides need
+│       ├── Cluster/                   # ConsistentHashRing, ReplicaLoadBalancer, ClusterTopology
+│       ├── Streaming/                 # ByteRange, RangeHeader, ContentRange, ChunkMap
+│       ├── Http/                      # StorageNodeClient, RetryPolicy, routes
+│       ├── Contracts/                 # VideoManifest, UploadResult, headers
+│       └── Security/ApiKeyGuard.cs
+├── tests/Heimdall.Tests/              # 162 xUnit tests
+├── deploy/
+│   ├── cluster.json                   # the shared node list, mounted into all 7 containers
+│   ├── gateway.Dockerfile
+│   └── storage-node.Dockerfile
+├── scripts/smoke-test.sh              # 23 end-to-end checks against a running cluster
+├── docker-compose.yml                 # 8 services
+└── Heimdall.sln
 ```
 
 ---
 
 ## Quick start
 
-### Prerequisites
+```bash
+docker compose up -d --build            # 8 containers; nodes wait on MinIO's health check
+docker compose ps                       # all should report (healthy)
 
-- Docker and Docker Compose
-- .NET 8 SDK (only if you want to run outside containers)
+scripts/smoke-test.sh                   # upload, replicate, range, fail over, resume, delete
+```
 
-### Run the cluster
+Then open <http://localhost:8090> for the browser console: pick a video file, upload it, and watch
+which node serves each read. Or by hand:
 
 ```bash
-docker compose up --build
+# upload (raw body - the browser, curl and the gateway all stream it)
+curl -X POST "http://localhost:8090/api/videos?fileName=film.mp4" \
+     -H "X-Heimdall-Key: dev-heimdall-key" \
+     -H "Content-Type: video/mp4" \
+     --data-binary @film.mp4
+
+# {"videoId":"film-71929383cc33","length":1073741824,
+#  "contentHash":"20dc30…","primaryNodeId":"node-3",
+#  "replicaNodeIds":["node-6","node-5"],"streamUrl":"…"}
+
+# seek 1 GiB in
+curl -r 1073740800-1073741823 \
+     http://localhost:8090/api/videos/film-71929383cc33 -o tail.bin
+
+# see the routing decision without moving any bytes
+curl -I http://localhost:8090/api/videos/film-71929383cc33
+
+# ask the ring where an id would land, contacting no node at all
+curl http://localhost:8090/api/cluster/placement/film-71929383cc33
 ```
 
-That brings up 8 services: `gateway` on `:8080`, `storage-node-1` … `storage-node-6` on `:9001`–`:9006`, and MinIO on `:9000` (console on `:9090`, default credentials `minioadmin` / `minioadmin` — change these before anything resembling production).
-
-### Upload a video
+Watch failover with your own eyes:
 
 ```bash
-curl -X POST http://localhost:8080/api/videos \
-  -H "X-Api-Key: dev-local-key" \
-  -H "Content-Type: video/mp4" \
-  --data-binary @big-video.mp4
+docker compose stop storage-node-3                      # kill a holder
+curl -I http://localhost:8090/api/videos/film-71929383cc33 | grep -i heimdall
+docker compose start storage-node-3
 ```
 
-```json
-{
-  "videoId": "9f2c1b7e-4a3d-4f61-9c08-2b5e1d7a3c44",
-  "sizeBytes": 4294967296,
-  "chunkCount": 512,
-  "primaryNode": "storage-node-4",
-  "replicas": ["storage-node-5", "storage-node-6"]
-}
-```
+Host ports: gateway **8090** (override with `HEIMDALL_GATEWAY_PORT`), storage nodes **8101–8106**,
+MinIO API **19000**, MinIO console **19001** (`heimdall` / `heimdall-secret`).
 
-### Stream it
-
-```bash
-# Whole file
-curl -o out.mp4 http://localhost:8080/api/videos/9f2c1b7e-.../content
-
-# A byte range — returns 206
-curl -r 1048576-2097151 \
-  -o slice.bin \
-  http://localhost:8080/api/videos/9f2c1b7e-.../content
-```
-
-Or point a browser at the URL directly — seeking in the player works, because ranges work.
-
-### Watch failover happen
-
-```bash
-docker compose stop storage-node-4     # kill the primary
-curl -o out.mp4 http://localhost:8080/api/videos/9f2c1b7e-.../content
-sha256sum out.mp4 big-video.mp4        # identical
-```
-
-### Run locally without Docker
-
-```bash
-dotnet run --project src/StorageNode -- --NodeId storage-node-1 --Urls http://localhost:9001
-dotnet run --project src/Gateway
-```
-
-You'll still need a MinIO instance reachable at `Storage:Endpoint`.
+Building locally without Docker needs the .NET 9 SDK: `dotnet build && dotnet test`.
 
 ---
 
 ## Configuration
 
-Set via `appsettings.json`, environment variables (`Cluster__ReplicationFactor=3`), or command-line args.
+`deploy/cluster.json` is mounted read-only into all seven .NET containers — the shared input that
+replaces a coordinator:
 
-### Gateway
+```json
+{
+  "Cluster": {
+    "ApiKey": "dev-heimdall-key",
+    "VirtualNodesPerNode": 512,
+    "ReplicationFactor": 3,
+    "ReadReplicaPercentage": 60,
+    "Nodes": [
+      { "Id": "node-1", "BaseUrl": "http://storage-node-1:8080", "Weight": 1 }
+    ]
+  }
+}
+```
 
-| Key | Default | Description |
+| Setting | Default | What it does |
 |---|---|---|
-| `Cluster:Nodes` | *(6 nodes)* | Node descriptors: `id`, `baseUrl`. The ring is derived from this list. |
-| `Cluster:VirtualNodesPerNode` | `150` | Ring positions per physical node. Higher = smoother distribution, slightly more memory. |
-| `Cluster:ReplicationFactor` | `3` | Distinct physical nodes holding each video. |
-| `Cluster:ReadReplicaPercentage` | `50` | Percentage of the replica set eligible to serve reads. |
-| `Cluster:NodeTimeoutMs` | `3000` | Per-request timeout before a node is considered unreachable. |
-| `Cluster:UnhealthyCooldownSeconds` | `30` | How long a failed node stays out of rotation. |
-| `Auth:ApiKey` | `dev-local-key` | Required on writes via `X-Api-Key`. |
+| `Cluster:VirtualNodesPerNode` | 512 | Tokens per unit of weight. See the table above. |
+| `Cluster:ReplicationFactor` | 3 | Holders per video. Clamped to the cluster size. |
+| `Cluster:ReadReplicaPercentage` | 60 | Share of replicas placed ahead of the primary for reads. |
+| `Cluster:ApiKey` | — | Shared secret for writes. Unset disables them. |
+| `Node:Id` | — | Must appear in `Cluster:Nodes`; the ring hashes this string. |
+| `Node:ChunkSizeBytes` | 8 MiB | Larger chunks mean fewer object-storage round trips per seek. |
+| `Node:ReplicationMaxAttempts` | 4 | Attempts per target before the copy is abandoned. |
+| `Node:ReplicationAttemptTimeout` | 10 min | Ceiling on one whole-video replication attempt. |
+| `Gateway:CandidateHeaderTimeout` | 10 s | Give up waiting for a node's *headers* and try the next. |
+| `Gateway:RelayIdleTimeout` | 15 s | Abandon a silent node mid-body and resume elsewhere. |
+| `Gateway:ProxyBufferBytes` | 128 KiB | Relay buffer size. |
 
-### Storage node
+Per-service settings come from environment variables in `docker-compose.yml`; anything in
+`appsettings.json` can be overridden with the usual `Section__Key` form.
 
-| Key | Default | Description |
-|---|---|---|
-| `Node:Id` | — | Must be unique and must match the gateway's node list. |
-| `Node:PublicBaseUrl` | — | How peers and the gateway reach this node. |
-| `Storage:Endpoint` | `minio:9000` | MinIO endpoint. |
-| `Storage:AccessKey` / `Storage:SecretKey` | `minioadmin` | MinIO credentials. |
-| `Storage:Bucket` | `videos` | Bucket name; created on startup if absent. |
-| `Storage:ChunkSizeBytes` | `8388608` (8 MiB) | Chunk size. Must be identical cluster-wide — range math depends on it. |
-| `Replication:MaxRetries` | `5` | Retry attempts per replica. |
-| `Replication:BaseDelayMs` | `500` | Backoff base; delays are exponential with jitter. |
-| `Auth:ApiKey` | `dev-local-key` | Shared secret for writes and replication. |
-
-> **Changing `ChunkSizeBytes` on a cluster that already holds data will corrupt range reads for existing videos.** Chunk size is recorded in each video's metadata; treat a change as a migration, not a config tweak.
+A storage node **refuses to start** if its `Node__Id` is absent from `Cluster:Nodes` — the ring
+hashes ids, so a mismatch means the process would own no keyspace, and failing loudly beats quietly
+running a node nobody routes to.
 
 ---
 
 ## API reference
 
-### Gateway (public)
+### Gateway — `http://localhost:8090`
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/videos` | Streams the request body in, returns `videoId` and placement. Requires `X-Api-Key`. |
-| `GET` | `/api/videos/{id}/content` | Full body, or `206` with `Content-Range` when `Range` is present. Fails over across replicas. |
-| `HEAD` | `/api/videos/{id}/content` | Size and `Accept-Ranges` without a body. |
-| `GET` | `/api/videos/{id}` | Metadata: size, chunk count, content type, primary, replica set. |
-| `DELETE` | `/api/videos/{id}` | Tombstones on the primary and fans out to replicas. Requires `X-Api-Key`. |
-| `GET` | `/api/cluster/ring` | Current ring view, node health, ownership for a probe key. Diagnostics. |
+| `POST` | `/api/videos?fileName=x.mp4` | Upload. Raw body or `multipart/form-data` (first file part, located with a streaming `MultipartReader`). Returns id, length, hash, placement, stream URL. **Key required.** |
+| `PUT` | `/api/videos/{id}` | Upload with an explicit id. **Key required.** |
+| `GET` | `/api/videos/{id}` | Stream. Honours `Range` → `206`. |
+| `HEAD` | `/api/videos/{id}` | Length, `ETag` and routing headers; no bytes moved. |
+| `GET` | `/api/videos/{id}/manifest` | Manifest from the first reachable holder, plus placement. |
+| `DELETE` | `/api/videos/{id}` | Remove from every holder. **Key required.** |
+| `GET` | `/api/cluster` | Nodes, token count, replication factor, measured keyspace shares. |
+| `GET` | `/api/cluster/health` | Live probe of every node. |
+| `GET` | `/api/cluster/placement/{id}` | Where an id routes — answered from the ring, contacting nothing. |
+| `GET` | `/api/cluster/distribution?keys=N` | Hash N synthetic keys through the real ring and report the spread. |
+| `GET` | `/api` | Endpoint index. |
 | `GET` | `/health` | Liveness. |
 
-### Storage node (internal — not for public exposure)
+### Storage node — `http://localhost:810{1..6}`
 
 | Method | Path | Notes |
 |---|---|---|
-| `PUT` | `/internal/videos/{id}` | Chunked write from a stream. `X-Api-Key`. |
-| `GET` | `/internal/videos/{id}` | Honours `Range`; returns `206` / `416` appropriately. |
-| `POST` | `/internal/videos/{id}/replicate` | Accepts a replica push from a primary. `X-Api-Key`. |
-| `GET` | `/internal/videos/{id}/metadata` | Chunk count, size, checksum. |
-| `GET` | `/health` | Used by the gateway's health tracker. |
+| `PUT` | `/internal/videos/{id}` | Streaming ingest → chunks + manifest. **Key required.** |
+| `GET` / `HEAD` | `/internal/videos/{id}` | Range-aware read straight out of chunks. |
+| `GET` | `/internal/videos/{id}/manifest` | 404 when this node does not hold it. |
+| `DELETE` | `/internal/videos/{id}` | **Key required.** |
+| `GET` | `/internal/replication[/{id}]` | Per-target replication state and attempt counts. |
+| `GET` | `/internal/node` | Id, bucket, chunk size, this node's keyspace share. |
+| `GET` | `/health`, `/ready` | `/ready` probes the bucket. |
 
 ---
 
 ## Testing
 
 ```bash
-dotnet test
+dotnet test                 # 162 unit tests, ~1s
+scripts/smoke-test.sh       # 23 end-to-end checks against the running cluster
 ```
 
-The xUnit suite in `tests/Shared.Tests` covers the parts where a quiet bug is expensive:
+The unit tests target the places where a subtle error would be invisible in a demo and corrupting in
+production.
 
-- **Hashing** — ring stability (same key → same node across rebuilds), distribution evenness across 6 nodes × 150 vnodes, and bounded remapping when a node is added or removed.
-- **Failover** — replica-set resolution, selection under `ReadReplicaPercentage`, correct next-candidate ordering when nodes are marked unhealthy, and cooldown expiry returning nodes to rotation.
-- **Byte-range math** — chunk index and offset derivation, first/last chunk trimming, open-ended (`bytes=500-`) and suffix (`bytes=-500`) ranges, off-by-one at chunk boundaries, and `416` conditions.
+**Hashing** — that the hash is the documented SHA-256 construction; that two independently
+constructed rings agree on placement across thousands of keys (the property that lets gateway and
+nodes route without talking); that the keyspace lands within 10% of even and that more tokens
+monotonically improve it; that adding a node moves ~1/N of keys and moves them *only onto the new
+node*; that removing one remaps only what it owned; that weights scale ownership; and that keys
+hashing past the final token wrap to the first.
 
-Beyond unit tests, the cluster was validated by hand across multiple processes: uploading multi-gigabyte files, downloading them from different replicas, and comparing SHA-256 digests to confirm **byte-identical** results — then killing a live primary mid-cluster and confirming reads continued to succeed, byte-identically, from a replica.
+**Load balancing** — selection-size arithmetic at every percentage (including that a non-zero
+percentage never rounds down to zero replicas); that candidates are always a permutation of the
+preference list, so no holder is dropped from the failover chain or retried twice; that rotation
+distributes first-choice reads *exactly* evenly; that a negative rotation counter does not throw;
+and that a replica never believes it owes replication to anyone.
+
+**Byte-range math** — every single-range header form including suffix ranges, clamping, 416, and
+multi-gigabyte offsets; plus an exhaustive check that *every* `(from, to)` pair over a 50-byte object
+decomposes into contiguous chunk slices whose lengths sum exactly.
+
+**Chunked storage** — round-trip byte-identity at every boundary case (empty, one byte, exactly one
+chunk, one byte over, exact multiples, ragged tails); that the ingest hash is the plain SHA-256 of
+the input; that a seek near the end of a 1,000-chunk video issues one chunk read rather than a
+thousand; and that chunk boundaries stay exact when the source dribbles 7 bytes at a time.
+
+**Failover** — a dead first candidate; a chain walked to its last member; a replica that has not
+caught up; a node returning 500; 404-everywhere (→ 404) versus a mix of 404 and unreachable (→ 503);
+and a range request that fails over mid-seek still returning the exact right slice.
+
+**Mid-stream resume** — a node that sends 20,000 of 60,000 bytes and then drops, with the response
+completed from another holder and compared byte for byte at the seam; that the resume names the
+correct absolute offset; that a resumed *range* request stays inside the client's requested window
+rather than the whole file; that a holder answering a resume with `200` is refused rather than
+concatenated; and that an unresumable truncation is reported honestly instead of claimed as success.
+
+The end-to-end script uploads a random file, polls for replication to land on all three holders,
+compares the download bit for bit, checks five byte ranges against the source (one of them
+straddling a chunk boundary), stops the node that just served a read and confirms the next holder
+returns identical bytes, then **SIGKILLs a node mid-download** and asserts the delivered file is
+still byte-identical.
 
 ---
 
 ## Design notes and trade-offs
 
-**Asynchronous replication means a write window.** The upload returns once the primary is durable. If the primary dies before replication completes, that video is lost. This is a deliberate latency-over-durability choice for video, where uploads are large and re-uploadable. A `WaitForReplicas` option (quorum write) is the natural counterweight and is on the roadmap.
+**Writes are primary-only; reads are not.** An upload goes to the one node the ring says owns it. The
+upload body is a one-shot stream, so there is nothing to replay if that node is down — the gateway
+returns 503 and the client retries against the same (stable) owner. Reads *can* be retried, so they
+fail over freely. Accepting a write on a non-owner would mean either buffering the whole upload or
+leaving a copy somewhere the ring will never look for it.
 
-**No anti-entropy pass yet.** Failed replications are retried and then logged. A reconciliation job that walks each node's prefix and repairs missing replicas is the missing piece for long-running clusters.
+**No health tracker.** An earlier design had the gateway mark nodes unhealthy with a decaying
+penalty. It was dropped: a 2-second `ConnectTimeout` makes a dead node cost ~2 s once per request,
+per-request failover is already correct without shared state, and a stale health verdict is its own
+source of bugs. Reintroducing it is a throughput optimisation, not a correctness fix.
 
-**The node list is static config.** Membership changes require a config change and a rolling restart. This keeps the ring consistent across gateways without needing consensus, at the cost of elastic scaling. A gossip or registry-backed membership layer would relax it.
+**Reads rotate instead of pinning.** Selecting replicas deterministically per `videoId` would keep
+page cache and MinIO read-ahead warm on one node per video. Rotating spreads load instead. Rotation
+is the right default for the stated goal — spreading traffic — and `ReadReplicaPercentage` is the knob
+between the two: lower it to concentrate reads on fewer, warmer nodes.
 
-**Chunk size is a cluster-wide invariant.** It buys cheap, exact range math with no per-video index; it costs flexibility. The trade felt right given ranges are the hot path.
+**The manifest is the commit marker.** Writing it last means a crashed ingest is invisible rather
+than half-readable. It also means the manifest is the single source of truth for chunk size, so a
+node can serve videos written under a different `ChunkSizeBytes` than it is currently configured
+with.
 
-**Reads are unauthenticated at the node level.** Storage nodes are intended to sit on a private network with only the gateway exposed. The `X-Api-Key` guard is on writes and replication, where an unauthenticated call is destructive rather than merely leaky.
+**One MinIO instance.** Each node owns a separate bucket, so a replica is a real second copy of the
+bytes — but they share a storage backend. This demonstrates cluster topology and placement, not
+independent failure domains.
 
 ---
 
 ## Roadmap
 
-- [ ] Quorum / `W`-configurable writes for stronger durability
-- [ ] Background anti-entropy and replica repair
-- [ ] Dynamic membership (registry or gossip) with online rebalancing
-- [ ] Per-video chunk-size metadata to make the parameter migratable
-- [ ] Signed URLs for read authorization at the gateway
-- [ ] Metrics: per-node ownership share, replica lag, range-hit distribution
-- [ ] Transcoding pipeline and HLS/DASH manifest generation
+Honest about what is out of scope for a single-author project:
 
----
-
-## License
-
-MIT.
+- **Anti-entropy.** If a replication target stays down past its retry budget, the copy is simply
+  missing; nothing later notices and repairs it. Real systems run a Merkle-tree or hinted-handoff
+  repair pass.
+- **Rebalancing on topology change.** The ring reshuffles correctly when `cluster.json` changes, but
+  existing videos are not migrated to their new owners, so they become unreachable until copied.
+- **Delete is best-effort.** A node that is down keeps its copy and will serve a deleted video when
+  it returns.
+- **Orphaned chunks.** Re-uploading a shorter video over a longer one leaves the extra chunks behind.
+  They are unreachable — the manifest bounds every read — but they do occupy space until swept.
+- **Transcoding, HLS/DASH packaging, CDN offload.** Heimdall serves the bytes it was given; it does
+  not produce renditions or manifests for adaptive bitrate.

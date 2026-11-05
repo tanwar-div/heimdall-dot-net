@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heimdall</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115; --panel: #171a21; --line: #272c37;
+    --fg: #e6e9ef; --muted: #8b93a7; --accent: #6ea8fe; --ok: #58d68d; --warn: #f5b041;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-size: 13px; line-height: 1.6; }
+  header { padding: 20px 24px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 18px; letter-spacing: .04em; }
+  h1 span { color: var(--muted); font-weight: 400; margin-left: 10px; font-size: 12px; }
+  main { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 20px; padding: 20px 24px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0,1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .panel h2 { margin: 0 0 12px; font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+  video { width: 100%; border-radius: 6px; background: #000; display: block; }
+  button { font: inherit; background: var(--accent); color: #0b0d11; border: 0; border-radius: 5px;
+           padding: 7px 14px; cursor: pointer; font-weight: 600; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); font-weight: 400; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=file], input[type=text] { font: inherit; color: var(--fg); background: #0f1115;
+           border: 1px solid var(--line); border-radius: 5px; padding: 7px; width: 100%; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); font-weight: 400; }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); font-size: 11px; }
+  .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .pill.down { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+  .muted { color: var(--muted); }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-all; color: var(--muted); font-size: 11px; max-height: 220px; overflow: auto; }
+  progress { width: 100%; height: 6px; }
+  ul.videos { list-style: none; margin: 0; padding: 0; }
+  ul.videos li { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); align-items: center; }
+  ul.videos code { color: var(--accent); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>HEIMDALL <span>distributed video streaming &middot; consistent-hash routing &middot; range streaming</span></h1>
+</header>
+
+<main>
+  <div>
+    <div class="panel">
+      <h2>Player</h2>
+      <video id="player" controls preload="metadata"></video>
+      <div class="row">
+        <input type="text" id="videoId" placeholder="video id (or pick one on the right)">
+        <button id="load">Load</button>
+      </div>
+      <div class="row muted" id="served"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Upload</h2>
+      <input type="file" id="file" accept="video/*">
+      <div class="row">
+        <input type="text" id="apiKey" placeholder="X-Heimdall-Key" value="dev-heimdall-key">
+        <button id="upload">Upload</button>
+      </div>
+      <div class="row"><progress id="progress" value="0" max="100" hidden></progress></div>
+      <pre id="uploadLog"></pre>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Cluster</h2>
+      <table id="nodes"><tbody></tbody></table>
+      <div class="row"><button class="ghost" id="refresh">Refresh</button></div>
+    </div>
+
+    <div class="panel">
+      <h2>Placement</h2>
+      <pre id="placement" class="muted">Load a video to see its ring placement.</pre>
+    </div>
+
+    <div class="panel">
+      <h2>Uploaded here</h2>
+      <ul class="videos" id="videos"></ul>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const KEY = 'heimdall.videos';
+
+const remembered = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } };
+const remember = (entry) => {
+  const list = remembered().filter(v => v.videoId !== entry.videoId);
+  list.unshift(entry);
+  try { localStorage.setItem(KEY, JSON.stringify(list.slice(0, 25))); } catch { /* private mode */ }
+  renderVideos();
+};
+
+function renderVideos() {
+  const list = remembered();
+  $('videos').innerHTML = list.length
+    ? list.map(v => `<li><code data-id="${v.videoId}" title="${v.videoId}">${v.videoId}</code>
+         <span class="muted">${(v.length/1048576).toFixed(1)} MB &middot; ${v.primaryNodeId}</span></li>`).join('')
+    : '<li class="muted">Nothing uploaded from this browser yet.</li>';
+
+  for (const el of $('videos').querySelectorAll('code')) {
+    el.onclick = () => { $('videoId').value = el.dataset.id; load(); };
+  }
+}
+
+async function refreshCluster() {
+  try {
+    const health = await (await fetch('/api/cluster/health')).json();
+    $('nodes').querySelector('tbody').innerHTML =
+      '<tr><th>Node</th><th>Address</th><th>State</th></tr>' +
+      health.nodes.map(n => `<tr><td>${n.id}</td><td class="muted">${n.baseUrl.replace(/^https?:\/\//,'')}</td>
+        <td><span class="pill ${n.healthy ? 'ok' : 'down'}">${n.healthy ? 'up' : 'down'}</span></td></tr>`).join('');
+  } catch (e) {
+    $('nodes').querySelector('tbody').innerHTML = `<tr><td class="muted">Gateway unreachable: ${e.message}</td></tr>`;
+  }
+}
+
+async function load() {
+  const id = $('videoId').value.trim();
+  if (!id) return;
+
+  $('player').src = `/api/videos/${encodeURIComponent(id)}`;
+  $('served').textContent = 'requesting...';
+
+  try {
+    // HEAD moves no bytes but still goes through the ring, so the headers show the routing decision.
+    const head = await fetch(`/api/videos/${encodeURIComponent(id)}`, { method: 'HEAD' });
+    const servedBy = head.headers.get('X-Heimdall-Served-By');
+    const primary = head.headers.get('X-Heimdall-Primary-Node');
+    const failedOver = head.headers.get('X-Heimdall-Failover-From');
+    const bytes = head.headers.get('Content-Length');
+
+    $('served').innerHTML = head.ok
+      ? `served by <span class="pill ok">${servedBy}</span> &nbsp; primary <span class="pill">${primary}</span>
+         ${failedOver ? `&nbsp; failed over from <span class="pill down">${failedOver}</span>` : ''}
+         &nbsp; <span class="muted">${(bytes/1048576).toFixed(1)} MB &middot; ranges ${head.headers.get('Accept-Ranges')}</span>`
+      : `<span class="pill down">HTTP ${head.status}</span>`;
+
+    const placement = await (await fetch(`/api/cluster/placement/${encodeURIComponent(id)}`)).json();
+    $('placement').textContent = JSON.stringify(placement, null, 2);
+  } catch (e) {
+    $('served').textContent = e.message;
+  }
+}
+
+function upload() {
+  const file = $('file').files[0];
+  if (!file) { $('uploadLog').textContent = 'Pick a file first.'; return; }
+
+  // XHR rather than fetch: it reports upload progress, which is the interesting part for a
+  // multi-gigabyte streaming PUT.
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', `/api/videos?fileName=${encodeURIComponent(file.name)}`);
+  xhr.setRequestHeader('X-Heimdall-Key', $('apiKey').value);
+  xhr.setRequestHeader('Content-Type', file.type || 'video/mp4');
+
+  $('progress').hidden = false;
+  $('upload').disabled = true;
+  $('uploadLog').textContent = `streaming ${file.name} (${(file.size/1048576).toFixed(1)} MB)...`;
+
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable) $('progress').value = (e.loaded / e.total) * 100; };
+
+  xhr.onload = () => {
+    $('upload').disabled = false;
+    $('progress').hidden = true;
+    try {
+      const body = JSON.parse(xhr.responseText);
+      $('uploadLog').textContent = JSON.stringify(body, null, 2);
+      if (xhr.status === 201) {
+        remember(body);
+        $('videoId').value = body.videoId;
+        load();
+      }
+    } catch {
+      $('uploadLog').textContent = `HTTP ${xhr.status}: ${xhr.responseText}`;
+    }
+  };
+
+  xhr.onerror = () => {
+    $('upload').disabled = false;
+    $('progress').hidden = true;
+    $('uploadLog').textContent = 'Upload failed at the transport level.';
+  };
+
+  // The File is sent as the raw request body: the browser streams it, the gateway streams it to the
+  // primary node, and the node chunks it into object storage. Nothing holds the whole file.
+  xhr.send(file);
+}
+
+$('upload').onclick = upload;
+$('load').onclick = load;
+$('refresh').onclick = refreshCluster;
+$('videoId').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+
+renderVideos();
+refreshCluster();
+setInterval(refreshCluster, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,161 @@
+# Heimdall: an 8-container cluster - 6 storage nodes, 1 gateway, 1 MinIO.
+#
+# Every .NET process mounts the same deploy/cluster.json, so all seven of them build an identical
+# consistent-hash ring and agree on placement without a coordinator. The only per-node settings are
+# the node's own id and its bucket.
+#
+#   docker compose up --build
+#   open http://localhost:8090
+#
+# Host ports: gateway 8090 (HEIMDALL_GATEWAY_PORT), storage nodes 8101-8106, MinIO API 19000, MinIO console 19001.
+
+name: heimdall-dotnet
+
+x-node-base: &node-base
+  build:
+    context: .
+    dockerfile: deploy/storage-node.Dockerfile
+  # All six nodes run the identical binary and differ only by id and bucket, so they share one
+  # image and one build.
+  image: heimdall-dotnet/storage-node:local
+  restart: unless-stopped
+  depends_on:
+    minio:
+      condition: service_healthy
+  volumes:
+    - ./deploy/cluster.json:/app/cluster.json:ro
+  environment: &node-env
+    ASPNETCORE_ENVIRONMENT: Production
+    Storage__Endpoint: http://minio:9000
+    Storage__AccessKey: heimdall
+    Storage__SecretKey: heimdall-secret
+    Storage__ForcePathStyle: "true"
+    Storage__CreateBucketIfMissing: "true"
+    Node__ChunkSizeBytes: "8388608"
+    Node__ReplicationEnabled: "true"
+    Node__ReplicationMaxAttempts: "4"
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/ready"]
+    interval: 10s
+    timeout: 3s
+    retries: 6
+    start_period: 15s
+
+services:
+  # Object storage shared by the cluster. Each node owns its own bucket, so a replica really is a
+  # second copy of the bytes rather than a second pointer at one object.
+  minio:
+    image: minio/minio:RELEASE.2025-04-08T15-41-24Z
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: heimdall
+      MINIO_ROOT_PASSWORD: heimdall-secret
+    ports:
+      - "19000:9000"   # S3 API
+      - "19001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  storage-node-1:
+    <<: *node-base
+    container_name: heimdall-storage-node-1
+    environment:
+      <<: *node-env
+      Node__Id: node-1
+      Storage__Bucket: heimdall-node-1
+    ports:
+      - "8101:8080"
+
+  storage-node-2:
+    <<: *node-base
+    container_name: heimdall-storage-node-2
+    environment:
+      <<: *node-env
+      Node__Id: node-2
+      Storage__Bucket: heimdall-node-2
+    ports:
+      - "8102:8080"
+
+  storage-node-3:
+    <<: *node-base
+    container_name: heimdall-storage-node-3
+    environment:
+      <<: *node-env
+      Node__Id: node-3
+      Storage__Bucket: heimdall-node-3
+    ports:
+      - "8103:8080"
+
+  storage-node-4:
+    <<: *node-base
+    container_name: heimdall-storage-node-4
+    environment:
+      <<: *node-env
+      Node__Id: node-4
+      Storage__Bucket: heimdall-node-4
+    ports:
+      - "8104:8080"
+
+  storage-node-5:
+    <<: *node-base
+    container_name: heimdall-storage-node-5
+    environment:
+      <<: *node-env
+      Node__Id: node-5
+      Storage__Bucket: heimdall-node-5
+    ports:
+      - "8105:8080"
+
+  storage-node-6:
+    <<: *node-base
+    container_name: heimdall-storage-node-6
+    environment:
+      <<: *node-env
+      Node__Id: node-6
+      Storage__Bucket: heimdall-node-6
+    ports:
+      - "8106:8080"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/gateway.Dockerfile
+    image: heimdall-dotnet/gateway:local
+    container_name: heimdall-gateway
+    restart: unless-stopped
+    # Started, not healthy: the gateway holds no state and must come up even when part of the
+    # cluster is down - that is the situation its failover path exists for.
+    depends_on:
+      - storage-node-1
+      - storage-node-2
+      - storage-node-3
+      - storage-node-4
+      - storage-node-5
+      - storage-node-6
+    volumes:
+      - ./deploy/cluster.json:/app/cluster.json:ro
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      Gateway__CandidateHeaderTimeout: "00:00:10"
+      Gateway__RelayIdleTimeout: "00:00:15"
+      Gateway__ProxyBufferBytes: "131072"
+    ports:
+      # Host port is overridable so the cluster can coexist with whatever else is on 8080:
+      #   HEIMDALL_GATEWAY_PORT=9090 docker compose up
+      - "${HEIMDALL_GATEWAY_PORT:-8090}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  minio-data:

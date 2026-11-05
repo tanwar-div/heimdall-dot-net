@@ -1,0 +1,22 @@
+# build output
+bin/
+obj/
+artifacts/
+publish/
+
+# local nuget cache used by the containerised build
+.nuget/
+
+# editors
+.vs/
+.idea/
+*.user
+*.suo
+*.swp
+
+# local scratch
+samples/
+*.mp4
+*.mkv
+*.mov
+*.webm

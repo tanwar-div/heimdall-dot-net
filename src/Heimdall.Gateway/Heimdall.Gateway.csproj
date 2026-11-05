@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <RootNamespace>Heimdall.Gateway</RootNamespace>
+    <AssemblyName>Heimdall.Gateway</AssemblyName>
+    <UserSecretsId>heimdall-gateway</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Heimdall.Shared\Heimdall.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The unit tests exercise internal helpers (slug building, short-read handling) directly. -->
+    <InternalsVisibleTo Include="Heimdall.Tests" />
+  </ItemGroup>
+
+</Project>
